@@ -3,11 +3,12 @@ const express = require('express')
 const qrcode = require('qrcode')
 const pino = require('pino')
 const { createClient } = require('@supabase/supabase-js')
+const path = require('path')
+const fs = require('fs')
 
 const app = express()
 app.use(express.json())
 
-// Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL || '',
   process.env.SUPABASE_KEY || ''
@@ -16,43 +17,50 @@ const supabase = createClient(
 let sock = null
 let qrCodeData = null
 let isConnected = false
+let isStarting = false
 
-// QR Code page
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Bindas AI — WA Server</title>
-      <meta http-equiv="refresh" content="10">
+      <title>Bindas AI WA Server</title>
+      <meta http-equiv="refresh" content="5">
       <style>
-        body { background: #0a0a0a; color: #fff; font-family: sans-serif; text-align: center; padding: 40px; }
-        h1 { color: #FFD700; }
-        img { margin: 20px auto; display: block; }
-        .status { padding: 10px 20px; border-radius: 8px; display: inline-block; margin: 10px; }
-        .connected { background: #1a4a1a; color: #4ade80; }
-        .disconnected { background: #4a1a1a; color: #f87171; }
+        body{background:#0a0a0a;color:#fff;font-family:sans-serif;text-align:center;padding:40px}
+        h1{color:#FFD700;font-size:24px;margin-bottom:20px}
+        .status{padding:10px 24px;border-radius:8px;display:inline-block;margin:10px;font-size:14px}
+        .connected{background:#1a4a1a;color:#4ade80}
+        .disconnected{background:#4a1a1a;color:#f87171}
+        .waiting{background:#2a2a1a;color:#fbbf24}
+        img{margin:20px auto;display:block;border:2px solid #FFD700;border-radius:8px}
+        p{color:#aaa;font-size:13px}
       </style>
     </head>
     <body>
       <h1>🤖 Bindas AI — WhatsApp Server</h1>
-      <div class="status ${isConnected ? 'connected' : 'disconnected'}">
-        ${isConnected ? '✅ Connected' : '❌ Disconnected'}
-      </div>
-      ${qrCodeData && !isConnected ? `<img src="${qrCodeData}" width="300" /><p>WhatsApp → Linked Devices → Scan QR</p>` : ''}
-      ${isConnected ? '<p>✅ WhatsApp connected and ready!</p>' : ''}
+      ${isConnected 
+        ? `<div class="status connected">✅ Connected & Ready</div>`
+        : qrCodeData 
+          ? `<div class="status waiting">⏳ Scan QR Code</div>
+             <img src="${qrCodeData}" width="280" />
+             <p>WhatsApp → Linked Devices → Link a Device → Scan</p>`
+          : `<div class="status disconnected">⏳ Generating QR... (auto refresh)</div>`
+      }
     </body>
     </html>
   `)
 })
 
-// Send message API
+app.get('/api/status', (req, res) => {
+  res.json({ connected: isConnected })
+})
+
 app.post('/api/send-message', async (req, res) => {
   const { phone, message } = req.body
   if (!sock || !isConnected) return res.json({ success: false, error: 'Not connected' })
-  
   try {
-    const jid = phone.replace('+', '') + '@s.whatsapp.net'
+    const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net'
     await sock.sendMessage(jid, { text: message })
     res.json({ success: true })
   } catch (err) {
@@ -60,12 +68,10 @@ app.post('/api/send-message', async (req, res) => {
   }
 })
 
-// Add to group API
 app.post('/api/groups/:groupId/add', async (req, res) => {
   const { groupId } = req.params
   const { participants } = req.body
   if (!sock || !isConnected) return res.json({ success: false, error: 'Not connected' })
-  
   try {
     const result = await sock.groupParticipantsUpdate(groupId, participants, 'add')
     res.json({ success: true, result })
@@ -74,80 +80,94 @@ app.post('/api/groups/:groupId/add', async (req, res) => {
   }
 })
 
-// Status API
-app.get('/api/status', (req, res) => {
-  res.json({ connected: isConnected, qr: qrCodeData ? true : false })
-})
-
-// Start WhatsApp
 async function startWA() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
-  
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: 'silent' })
-  })
+  if (isStarting) return
+  isStarting = true
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
-    
-    if (qr) {
-      qrCodeData = await qrcode.toDataURL(qr)
-      isConnected = false
-      console.log('QR Code generated — scan it!')
-    }
-    
-    if (connection === 'close') {
-      isConnected = false
-      qrCodeData = null
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
-      if (shouldReconnect) {
-        console.log('Reconnecting...')
-        setTimeout(startWA, 3000)
+  try {
+    const authDir = '/tmp/auth_info'
+    if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true })
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir)
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: true,
+      logger: pino({ level: 'silent' }),
+      browser: ['Bindas AI', 'Chrome', '1.0.0']
+    })
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update
+
+      if (qr) {
+        console.log('QR received, generating image...')
+        qrCodeData = await qrcode.toDataURL(qr)
+        isConnected = false
+        console.log('QR ready — open browser to scan')
       }
-    }
-    
-    if (connection === 'open') {
-      isConnected = true
-      qrCodeData = null
-      console.log('✅ WhatsApp Connected!')
-    }
-  })
 
-  // New message received — save to Supabase for follow-up
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue
-      if (!msg.key.remoteJid.includes('@s.whatsapp.net')) continue
-      
-      const phone = '+' + msg.key.remoteJid.replace('@s.whatsapp.net', '')
-      
-      // Save to Supabase wa_follow_up table
-      if (supabase) {
-        const { data } = await supabase
-          .from('wa_follow_up')
-          .select('id')
-          .eq('phone', phone)
-          .eq('status', 'pending')
-          .single()
-        
-        if (!data) {
-          await supabase.from('wa_follow_up').insert({
-            phone,
-            received_at: new Date().toISOString(),
-            status: 'pending'
-          })
-          console.log('New lead saved:', phone)
+      if (connection === 'close') {
+        isConnected = false
+        isStarting = false
+        const code = lastDisconnect?.error?.output?.statusCode
+        console.log('Connection closed, code:', code)
+        if (code !== DisconnectReason.loggedOut) {
+          console.log('Reconnecting in 3s...')
+          setTimeout(startWA, 3000)
+        } else {
+          console.log('Logged out — clear auth and restart')
+          qrCodeData = null
         }
       }
-    }
-  })
 
-  sock.ev.on('creds.update', saveCreds)
+      if (connection === 'open') {
+        isConnected = true
+        qrCodeData = null
+        isStarting = false
+        console.log('✅ WhatsApp Connected!')
+      }
+    })
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue
+        if (!msg.key.remoteJid?.includes('@s.whatsapp.net')) continue
+        const phone = '+' + msg.key.remoteJid.replace('@s.whatsapp.net', '')
+        console.log('New message from:', phone)
+        try {
+          const { data } = await supabase
+            .from('wa_follow_up')
+            .select('id')
+            .eq('phone', phone)
+            .eq('status', 'pending')
+            .maybeSingle()
+          if (!data) {
+            await supabase.from('wa_follow_up').insert({
+              phone,
+              received_at: new Date().toISOString(),
+              status: 'pending'
+            })
+            console.log('Lead saved:', phone)
+          }
+        } catch (e) {
+          console.log('Supabase error:', e.message)
+        }
+      }
+    })
+
+    sock.ev.on('creds.update', saveCreds)
+
+  } catch (err) {
+    console.error('startWA error:', err)
+    isStarting = false
+    setTimeout(startWA, 5000)
+  }
 }
 
-startWA()
-
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log(`Bindas WA Server running on port ${PORT}`))
+const PORT = process.env.PORT || 8080
+app.listen(PORT, () => {
+  console.log(`Bindas WA Server running on port ${PORT}`)
+  startWA()
+})
