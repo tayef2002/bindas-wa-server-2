@@ -1,9 +1,7 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
+const { Client, LocalAuth } = require('whatsapp-web.js')
 const express = require('express')
 const qrcode = require('qrcode')
-const P = require('pino')
 const { createClient } = require('@supabase/supabase-js')
-const fs = require('fs')
 
 const app = express()
 app.use(express.json())
@@ -15,30 +13,31 @@ const supabase = createClient(
 
 let qrCodeData = null
 let isConnected = false
+let client = null
 
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html>
 <head>
   <title>Bindas AI WA Server</title>
-  <meta http-equiv="refresh" content="3">
+  <meta http-equiv="refresh" content="5">
   <style>
     body{background:#0a0a0a;color:#fff;font-family:sans-serif;text-align:center;padding:40px}
     h1{color:#FFD700;font-size:24px;margin-bottom:20px}
-    .connected{background:#1a4a1a;color:#4ade80;padding:10px 24px;border-radius:8px;display:inline-block}
-    .waiting{background:#2a2a1a;color:#fbbf24;padding:10px 24px;border-radius:8px;display:inline-block}
-    .gen{background:#3a1a1a;color:#f87171;padding:10px 24px;border-radius:8px;display:inline-block}
-    img{margin:20px auto;display:block;border:2px solid #FFD700;border-radius:8px}
-    p{color:#aaa;font-size:13px}
+    .connected{background:#1a4a1a;color:#4ade80;padding:12px 28px;border-radius:8px;display:inline-block;font-size:16px}
+    .waiting{background:#2a2a1a;color:#fbbf24;padding:12px 28px;border-radius:8px;display:inline-block;font-size:16px}
+    .gen{background:#3a1a1a;color:#f87171;padding:12px 28px;border-radius:8px;display:inline-block;font-size:16px}
+    img{margin:20px auto;display:block;border:3px solid #FFD700;border-radius:12px}
+    p{color:#aaa;font-size:13px;margin-top:10px}
   </style>
 </head>
 <body>
   <h1>🤖 Bindas AI — WhatsApp Server</h1>
   ${isConnected
-    ? '<div class="connected">✅ Connected!</div>'
+    ? '<div class="connected">✅ WhatsApp Connected!</div>'
     : qrCodeData
-      ? `<div class="waiting">📱 Scan QR Code</div><br><img src="${qrCodeData}" width="280"/><p>WhatsApp → Linked Devices → Link a Device → Scan</p>`
-      : '<div class="gen">⏳ Starting... please wait (auto refresh)</div>'
+      ? `<div class="waiting">📱 QR Code Ready — Scan Now!</div><br><img src="${qrCodeData}" width="300"/><p>WhatsApp → Linked Devices → Link a Device → Scan QR</p>`
+      : '<div class="gen">⏳ Starting... please wait (auto refresh every 5 sec)</div>'
   }
 </body>
 </html>`)
@@ -46,58 +45,84 @@ app.get('/', (req, res) => {
 
 app.get('/api/status', (req, res) => res.json({ connected: isConnected }))
 
-async function start() {
-  const authDir = '/tmp/wa_auth'
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true })
+app.post('/api/send-message', async (req, res) => {
+  if (!client || !isConnected) return res.json({ success: false, error: 'Not connected' })
+  try {
+    const { phone, message } = req.body
+    const chatId = phone.replace(/\D/g, '') + '@c.us'
+    await client.sendMessage(chatId, message)
+    res.json({ success: true })
+  } catch (err) {
+    res.json({ success: false, error: err.message })
+  }
+})
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir)
-  const logger = P({ level: 'silent' })
-
-  const sock = makeWASocket({
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger)
-    },
-    logger,
-    printQRInTerminal: false,
-    browser: ['Ubuntu', 'Chrome', '22.04'],
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 10000,
-    emitOwnEvents: false,
-    fireInitQueries: true,
-    generateHighQualityLinkPreview: false,
-    syncFullHistory: false,
-    markOnlineOnConnect: false
+function startClient() {
+  client = new Client({
+    authStrategy: new LocalAuth({ dataPath: '/tmp/wa_session' }),
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ]
+    }
   })
 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      console.log('✅ QR generated!')
-      qrCodeData = await qrcode.toDataURL(qr)
-      isConnected = false
-    }
-    if (connection === 'open') {
-      console.log('✅ WhatsApp Connected!')
-      isConnected = true
-      qrCodeData = null
-    }
-    if (connection === 'close') {
-      isConnected = false
-      const code = lastDisconnect?.error?.output?.statusCode
-      console.log('Closed, code:', code)
-      if (code !== DisconnectReason.loggedOut) {
-        console.log('Restarting...')
-        setTimeout(start, 5000)
+  client.on('qr', async (qr) => {
+    console.log('✅ QR received!')
+    qrCodeData = await qrcode.toDataURL(qr)
+    isConnected = false
+  })
+
+  client.on('ready', () => {
+    console.log('✅ WhatsApp Connected!')
+    isConnected = true
+    qrCodeData = null
+  })
+
+  client.on('disconnected', (reason) => {
+    console.log('Disconnected:', reason)
+    isConnected = false
+    qrCodeData = null
+    setTimeout(startClient, 5000)
+  })
+
+  client.on('message', async (msg) => {
+    if (msg.fromMe) return
+    const phone = '+' + msg.from.replace('@c.us', '')
+    console.log('New message from:', phone)
+    try {
+      const { data } = await supabase
+        .from('wa_follow_up')
+        .select('id')
+        .eq('phone', phone)
+        .eq('status', 'pending')
+        .maybeSingle()
+      if (!data) {
+        await supabase.from('wa_follow_up').insert({
+          phone,
+          received_at: new Date().toISOString(),
+          status: 'pending'
+        })
+        console.log('Lead saved:', phone)
       }
+    } catch (e) {
+      console.log('DB error:', e.message)
     }
   })
 
-  sock.ev.on('creds.update', saveCreds)
+  client.initialize()
 }
 
 const PORT = process.env.PORT || 8080
 app.listen(PORT, () => {
-  console.log('Server on port', PORT)
-  setTimeout(start, 2000)
+  console.log('Server running on port', PORT)
+  startClient()
 })
