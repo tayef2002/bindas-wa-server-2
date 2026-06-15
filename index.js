@@ -6,7 +6,6 @@ const { createClient } = require('@supabase/supabase-js')
 const app = express()
 app.use(express.json())
 
-// CORS — allow all origins
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*')
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
@@ -61,7 +60,6 @@ app.post('/api/send-message', async (req, res) => {
     const chatId = phone.replace(/\D/g, '').replace(/^880/, '880') + '@c.us'
     await client.sendMessage(chatId, message)
     
-    // Save outgoing message
     await supabase.from('wa_messages').insert({
       phone,
       message,
@@ -115,11 +113,20 @@ function startClient() {
 
   client.on('message', async (msg) => {
     if (msg.fromMe) return
-    const phone = '+' + msg.from.replace(/@c\.us|@lid|@s\.whatsapp\.net/g, '')
+
+    // FIX 1: @lid number skip — শুধু @c.us process করো
+    if (!msg.from.includes('@c.us')) {
+      console.log('Skipping non-c.us message from:', msg.from)
+      return
+    }
+
+    // FIX 2: সঠিক phone number extract
+    const phone = '+' + msg.from.replace('@c.us', '')
     const body = msg.body || ''
     console.log('New message from:', phone, ':', body)
+
     try {
-      // Save to wa_messages
+      // Save to wa_messages (সব message save হবে)
       await supabase.from('wa_messages').insert({
         phone,
         message: body,
@@ -128,20 +135,26 @@ function startClient() {
         created_at: new Date().toISOString()
       })
 
-      // Save lead if not exists
-      const { data } = await supabase
+      // FIX 3: wa_follow_up — upsert, duplicate নয়
+      const { data: existing } = await supabase
         .from('wa_follow_up')
         .select('id')
         .eq('phone', phone)
-        .eq('status', 'pending')
         .maybeSingle()
-      if (!data) {
+
+      if (!existing) {
         await supabase.from('wa_follow_up').insert({
           phone,
           received_at: new Date().toISOString(),
           status: 'pending'
         })
-        console.log('Lead saved:', phone)
+        console.log('New lead saved:', phone)
+      } else {
+        // update received_at so it stays on top
+        await supabase.from('wa_follow_up')
+          .update({ received_at: new Date().toISOString() })
+          .eq('phone', phone)
+        console.log('Lead updated:', phone)
       }
     } catch (e) {
       console.log('DB error:', e.message)
