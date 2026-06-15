@@ -59,7 +59,6 @@ app.post('/api/send-message', async (req, res) => {
     const { phone, message } = req.body
     const chatId = phone.replace(/\D/g, '').replace(/^880/, '880') + '@c.us'
     await client.sendMessage(chatId, message)
-    
     await supabase.from('wa_messages').insert({
       phone,
       message,
@@ -67,12 +66,29 @@ app.post('/api/send-message', async (req, res) => {
       media_type: 'text',
       created_at: new Date().toISOString()
     })
-    
     res.json({ success: true })
   } catch (err) {
     res.json({ success: false, error: err.message })
   }
 })
+
+function extractPhone(msg) {
+  // Try @c.us first
+  if (msg.from && msg.from.includes('@c.us')) {
+    return '+' + msg.from.replace('@c.us', '')
+  }
+  // @lid — try _data.id.user (real phone number)
+  const user = msg._data?.id?.user
+  if (user && user.length > 5 && !user.includes('@')) {
+    return '+' + user.replace(/\D/g, '')
+  }
+  // Try author field
+  const author = msg.author || msg._data?.author || ''
+  if (author && author.includes('@c.us')) {
+    return '+' + author.replace('@c.us', '')
+  }
+  return null
+}
 
 function startClient() {
   client = new Client({
@@ -93,13 +109,13 @@ function startClient() {
   })
 
   client.on('qr', async (qr) => {
-    console.log('✅ QR received!')
+    console.log('QR received!')
     qrCodeData = await qrcode.toDataURL(qr)
     isConnected = false
   })
 
   client.on('ready', () => {
-    console.log('✅ WhatsApp Connected!')
+    console.log('WhatsApp Connected!')
     isConnected = true
     qrCodeData = null
   })
@@ -114,19 +130,16 @@ function startClient() {
   client.on('message', async (msg) => {
     if (msg.fromMe) return
 
-    // FIX 1: @lid number skip — শুধু @c.us process করো
-    if (!msg.from.includes('@c.us')) {
-      console.log('Skipping non-c.us message from:', msg.from)
+    const phone = extractPhone(msg)
+    if (!phone) {
+      console.log('Cannot extract phone, raw from:', msg.from, 'data id user:', msg._data?.id?.user)
       return
     }
 
-    // FIX 2: সঠিক phone number extract
-    const phone = '+' + msg.from.replace('@c.us', '')
     const body = msg.body || ''
     console.log('New message from:', phone, ':', body)
 
     try {
-      // Save to wa_messages (সব message save হবে)
       await supabase.from('wa_messages').insert({
         phone,
         message: body,
@@ -135,7 +148,6 @@ function startClient() {
         created_at: new Date().toISOString()
       })
 
-      // FIX 3: wa_follow_up — upsert, duplicate নয়
       const { data: existing } = await supabase
         .from('wa_follow_up')
         .select('id')
@@ -150,7 +162,6 @@ function startClient() {
         })
         console.log('New lead saved:', phone)
       } else {
-        // update received_at so it stays on top
         await supabase.from('wa_follow_up')
           .update({ received_at: new Date().toISOString() })
           .eq('phone', phone)
