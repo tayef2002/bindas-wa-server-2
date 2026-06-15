@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
 const express = require('express')
 const { createClient } = require('@supabase/supabase-js')
 const { Boom } = require('@hapi/boom')
@@ -59,14 +59,10 @@ app.post('/api/send-message', async (req, res) => {
   if (!sock || !isConnected) return res.json({ success: false, error: 'Not connected' })
   try {
     const { phone, message } = req.body
-    // phone = +8801XXXXXXXXX format
     const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net'
     await sock.sendMessage(jid, { text: message })
     await supabase.from('wa_messages').insert({
-      phone,
-      message,
-      direction: 'out',
-      media_type: 'text',
+      phone, message, direction: 'out', media_type: 'text',
       created_at: new Date().toISOString()
     })
     res.json({ success: true })
@@ -76,101 +72,95 @@ app.post('/api/send-message', async (req, res) => {
 })
 
 async function startClient() {
-  const { state, saveCreds } = await useMultiFileAuthState('/tmp/baileys_session_v1')
-  const { version } = await fetchLatestBaileysVersion()
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('/tmp/baileys_v2')
 
-  sock = makeWASocket({
-    version,
-    auth: state,
-    logger: P({ level: 'silent' }),
-    printQRInTerminal: false,
-    generateHighQualityLinkPreview: false,
-  })
+    sock = makeWASocket({
+      auth: state,
+      logger: P({ level: 'silent' }),
+      printQRInTerminal: false,
+      browser: ['Bindas AI', 'Chrome', '1.0.0'],
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+    })
 
-  sock.ev.on('creds.update', saveCreds)
+    sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update
 
-    if (qr) {
-      console.log('QR received!')
-      qrCodeData = await QRCode.toDataURL(qr)
-      isConnected = false
-    }
-
-    if (connection === 'close') {
-      isConnected = false
-      qrCodeData = null
-      const shouldReconnect = lastDisconnect?.error instanceof Boom
-        ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
-        : true
-      console.log('Disconnected, reconnect:', shouldReconnect)
-      if (shouldReconnect) setTimeout(startClient, 3000)
-    }
-
-    if (connection === 'open') {
-      console.log('WhatsApp Connected!')
-      isConnected = true
-      qrCodeData = null
-    }
-  })
-
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue
-      if (!msg.message) continue
-
-      // Real phone number — Baileys দেয় সরাসরি
-      const jid = msg.key.remoteJid || ''
-      const phone = '+' + jid.replace('@s.whatsapp.net', '').replace('@g.us', '').replace(/\D/g, '')
-      
-      if (!phone || phone === '+') continue
-
-      const body = msg.message?.conversation
-        || msg.message?.extendedTextMessage?.text
-        || msg.message?.imageMessage?.caption
-        || '[media]'
-
-      const name = msg.pushName || ''
-
-      console.log('New message from:', phone, 'name:', name, ':', body)
-
-      try {
-        await supabase.from('wa_messages').insert({
-          phone,
-          message: body,
-          direction: 'in',
-          media_type: 'text',
-          created_at: new Date().toISOString()
-        })
-
-        const { data: existing } = await supabase
-          .from('wa_follow_up')
-          .select('id')
-          .eq('phone', phone)
-          .maybeSingle()
-
-        if (!existing) {
-          await supabase.from('wa_follow_up').insert({
-            phone,
-            name,
-            received_at: new Date().toISOString(),
-            status: 'pending'
-          })
-          console.log('New lead saved:', phone, name)
-        } else {
-          await supabase.from('wa_follow_up')
-            .update({ received_at: new Date().toISOString(), name })
-            .eq('phone', phone)
-          console.log('Lead updated:', phone)
-        }
-      } catch (e) {
-        console.log('DB error:', e.message)
+      if (qr) {
+        console.log('QR received!')
+        qrCodeData = await QRCode.toDataURL(qr)
+        isConnected = false
       }
-    }
-  })
+
+      if (connection === 'close') {
+        isConnected = false
+        qrCodeData = null
+        const code = lastDisconnect?.error instanceof Boom
+          ? lastDisconnect.error.output.statusCode
+          : 0
+        console.log('Disconnected, code:', code)
+        if (code !== DisconnectReason.loggedOut) {
+          setTimeout(startClient, 5000)
+        }
+      }
+
+      if (connection === 'open') {
+        console.log('WhatsApp Connected!')
+        isConnected = true
+        qrCodeData = null
+      }
+    })
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue
+        if (!msg.message) continue
+
+        const jid = msg.key.remoteJid || ''
+        if (!jid.includes('@s.whatsapp.net')) continue
+
+        const phone = '+' + jid.replace('@s.whatsapp.net', '')
+        const body = msg.message?.conversation
+          || msg.message?.extendedTextMessage?.text
+          || '[media]'
+        const name = msg.pushName || ''
+
+        console.log('New message from:', phone, 'name:', name, ':', body)
+
+        try {
+          await supabase.from('wa_messages').insert({
+            phone, message: body, direction: 'in', media_type: 'text',
+            created_at: new Date().toISOString()
+          })
+
+          const { data: existing } = await supabase
+            .from('wa_follow_up').select('id').eq('phone', phone).maybeSingle()
+
+          if (!existing) {
+            await supabase.from('wa_follow_up').insert({
+              phone, name, received_at: new Date().toISOString(), status: 'pending'
+            })
+            console.log('New lead saved:', phone, name)
+          } else {
+            await supabase.from('wa_follow_up')
+              .update({ received_at: new Date().toISOString(), name })
+              .eq('phone', phone)
+            console.log('Lead updated:', phone)
+          }
+        } catch (e) {
+          console.log('DB error:', e.message)
+        }
+      }
+    })
+
+  } catch (e) {
+    console.log('startClient error:', e.message)
+    setTimeout(startClient, 5000)
+  }
 }
 
 const PORT = process.env.PORT || 8080
