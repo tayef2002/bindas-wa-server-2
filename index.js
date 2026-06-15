@@ -60,6 +60,16 @@ app.post('/api/send-message', async (req, res) => {
     const { phone, message } = req.body
     const chatId = phone.replace(/\D/g, '') + '@c.us'
     await client.sendMessage(chatId, message)
+    
+    // Save outgoing message
+    await supabase.from('wa_messages').insert({
+      phone,
+      message,
+      direction: 'out',
+      media_type: 'text',
+      created_at: new Date().toISOString()
+    })
+    
     res.json({ success: true })
   } catch (err) {
     res.json({ success: false, error: err.message })
@@ -106,8 +116,19 @@ function startClient() {
   client.on('message', async (msg) => {
     if (msg.fromMe) return
     const phone = '+' + msg.from.replace('@c.us', '')
-    console.log('New message from:', phone)
+    const body = msg.body || ''
+    console.log('New message from:', phone, ':', body)
     try {
+      // Save to wa_messages
+      await supabase.from('wa_messages').insert({
+        phone,
+        message: body,
+        direction: 'in',
+        media_type: msg.type || 'text',
+        created_at: new Date().toISOString()
+      })
+
+      // Save lead if not exists
       const { data } = await supabase
         .from('wa_follow_up')
         .select('id')
