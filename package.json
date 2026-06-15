@@ -1,17 +1,15 @@
 {
   "name": "bindas-wa-server",
   "version": "1.0.0",
-  "description": "Bindas AI WhatsApp Server",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
+    "whatsapp-web.js": "^1.23.0",
     "express": "^4.18.2",
     "qrcode": "^1.5.3",
-    "pino": "^8.15.0",
     "@supabase/supabase-js": "^2.38.0",
-    "axios": "^1.6.0"
+    "puppeteer": "^21.0.0"
   }
 }
