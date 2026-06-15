@@ -1,7 +1,9 @@
-const { Client, LocalAuth } = require('whatsapp-web.js')
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
 const express = require('express')
-const qrcode = require('qrcode')
 const { createClient } = require('@supabase/supabase-js')
+const { Boom } = require('@hapi/boom')
+const QRCode = require('qrcode')
+const P = require('pino')
 
 const app = express()
 app.use(express.json())
@@ -21,7 +23,7 @@ const supabase = createClient(
 
 let qrCodeData = null
 let isConnected = false
-let client = null
+let sock = null
 
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
@@ -54,11 +56,12 @@ app.get('/', (req, res) => {
 app.get('/api/status', (req, res) => res.json({ connected: isConnected }))
 
 app.post('/api/send-message', async (req, res) => {
-  if (!client || !isConnected) return res.json({ success: false, error: 'Not connected' })
+  if (!sock || !isConnected) return res.json({ success: false, error: 'Not connected' })
   try {
     const { phone, message } = req.body
-    const chatId = phone.replace(/\D/g, '').replace(/^880/, '880') + '@c.us'
-    await client.sendMessage(chatId, message)
+    // phone = +8801XXXXXXXXX format
+    const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net'
+    await sock.sendMessage(jid, { text: message })
     await supabase.from('wa_messages').insert({
       phone,
       message,
@@ -72,107 +75,102 @@ app.post('/api/send-message', async (req, res) => {
   }
 })
 
-function extractPhone(msg) {
-  // Try @c.us first
-  if (msg.from && msg.from.includes('@c.us')) {
-    return '+' + msg.from.replace('@c.us', '')
-  }
-  // @lid — try _data.id.user (real phone number)
-  const user = msg._data?.id?.user
-  if (user && user.length > 5 && !user.includes('@')) {
-    return '+' + user.replace(/\D/g, '')
-  }
-  // Try author field
-  const author = msg.author || msg._data?.author || ''
-  if (author && author.includes('@c.us')) {
-    return '+' + author.replace('@c.us', '')
-  }
-  return null
-}
+async function startClient() {
+  const { state, saveCreds } = await useMultiFileAuthState('/tmp/wa_session_baileys')
+  const { version } = await fetchLatestBaileysVersion()
 
-function startClient() {
-  client = new Client({
-    authStrategy: new LocalAuth({ dataPath: '/tmp/wa_session' }),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
-      ]
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger: P({ level: 'silent' }),
+    printQRInTerminal: false,
+    generateHighQualityLinkPreview: false,
+  })
+
+  sock.ev.on('creds.update', saveCreds)
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
+
+    if (qr) {
+      console.log('QR received!')
+      qrCodeData = await QRCode.toDataURL(qr)
+      isConnected = false
+    }
+
+    if (connection === 'close') {
+      isConnected = false
+      qrCodeData = null
+      const shouldReconnect = lastDisconnect?.error instanceof Boom
+        ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
+        : true
+      console.log('Disconnected, reconnect:', shouldReconnect)
+      if (shouldReconnect) setTimeout(startClient, 3000)
+    }
+
+    if (connection === 'open') {
+      console.log('WhatsApp Connected!')
+      isConnected = true
+      qrCodeData = null
     }
   })
 
-  client.on('qr', async (qr) => {
-    console.log('QR received!')
-    qrCodeData = await qrcode.toDataURL(qr)
-    isConnected = false
-  })
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return
 
-  client.on('ready', () => {
-    console.log('WhatsApp Connected!')
-    isConnected = true
-    qrCodeData = null
-  })
+    for (const msg of messages) {
+      if (msg.key.fromMe) continue
+      if (!msg.message) continue
 
-  client.on('disconnected', (reason) => {
-    console.log('Disconnected:', reason)
-    isConnected = false
-    qrCodeData = null
-    setTimeout(startClient, 5000)
-  })
+      // Real phone number — Baileys দেয় সরাসরি
+      const jid = msg.key.remoteJid || ''
+      const phone = '+' + jid.replace('@s.whatsapp.net', '').replace('@g.us', '').replace(/\D/g, '')
+      
+      if (!phone || phone === '+') continue
 
-  client.on('message', async (msg) => {
-    if (msg.fromMe) return
+      const body = msg.message?.conversation
+        || msg.message?.extendedTextMessage?.text
+        || msg.message?.imageMessage?.caption
+        || '[media]'
 
-    const phone = extractPhone(msg)
-    if (!phone) {
-      console.log('Cannot extract phone, raw from:', msg.from, 'data id user:', msg._data?.id?.user)
-      return
-    }
+      const name = msg.pushName || ''
 
-    const body = msg.body || ''
-    console.log('New message from:', phone, ':', body)
+      console.log('New message from:', phone, 'name:', name, ':', body)
 
-    try {
-      await supabase.from('wa_messages').insert({
-        phone,
-        message: body,
-        direction: 'in',
-        media_type: msg.type || 'text',
-        created_at: new Date().toISOString()
-      })
-
-      const { data: existing } = await supabase
-        .from('wa_follow_up')
-        .select('id')
-        .eq('phone', phone)
-        .maybeSingle()
-
-      if (!existing) {
-        await supabase.from('wa_follow_up').insert({
+      try {
+        await supabase.from('wa_messages').insert({
           phone,
-          received_at: new Date().toISOString(),
-          status: 'pending'
+          message: body,
+          direction: 'in',
+          media_type: 'text',
+          created_at: new Date().toISOString()
         })
-        console.log('New lead saved:', phone)
-      } else {
-        await supabase.from('wa_follow_up')
-          .update({ received_at: new Date().toISOString() })
+
+        const { data: existing } = await supabase
+          .from('wa_follow_up')
+          .select('id')
           .eq('phone', phone)
-        console.log('Lead updated:', phone)
+          .maybeSingle()
+
+        if (!existing) {
+          await supabase.from('wa_follow_up').insert({
+            phone,
+            name,
+            received_at: new Date().toISOString(),
+            status: 'pending'
+          })
+          console.log('New lead saved:', phone, name)
+        } else {
+          await supabase.from('wa_follow_up')
+            .update({ received_at: new Date().toISOString(), name })
+            .eq('phone', phone)
+          console.log('Lead updated:', phone)
+        }
+      } catch (e) {
+        console.log('DB error:', e.message)
       }
-    } catch (e) {
-      console.log('DB error:', e.message)
     }
   })
-
-  client.initialize()
 }
 
 const PORT = process.env.PORT || 8080
