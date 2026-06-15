@@ -58,7 +58,7 @@ app.post('/api/send-message', async (req, res) => {
   if (!client || !isConnected) return res.json({ success: false, error: 'Not connected' })
   try {
     const { phone, message } = req.body
-    const chatId = phone.replace(/\D/g, '') + '@c.us'
+    const chatId = phone.replace(/\D/g, '').replace(/^880/, '880') + '@c.us'
     await client.sendMessage(chatId, message)
     
     // Save outgoing message
@@ -115,7 +115,7 @@ function startClient() {
 
   client.on('message', async (msg) => {
     if (msg.fromMe) return
-    const phone = '+' + msg.from.replace('@c.us', '')
+    const phone = '+' + msg.from.replace(/@c\.us|@lid|@s\.whatsapp\.net/g, '')
     const body = msg.body || ''
     console.log('New message from:', phone, ':', body)
     try {
