@@ -76,7 +76,7 @@ app.post('/api/send-message', async (req, res) => {
 })
 
 async function startClient() {
-  const { state, saveCreds } = await useMultiFileAuthState('/tmp/wa_session_baileys')
+  const { state, saveCreds } = await useMultiFileAuthState('/tmp/baileys_session_v1')
   const { version } = await fetchLatestBaileysVersion()
 
   sock = makeWASocket({
