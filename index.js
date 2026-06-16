@@ -56,6 +56,17 @@ app.get('/', (req, res) => {
 
 app.get('/api/status', (req, res) => res.json({ connected: isConnected }))
 
+app.post('/api/disconnect', async (req, res) => {
+  if (!sock) return res.json({ success: false, error: 'Not connected' })
+  try {
+    await sock.logout()
+    isConnected = false
+    res.json({ success: true })
+  } catch (err) {
+    res.json({ success: false, error: err.message })
+  }
+})
+
 app.post('/api/send-message', async (req, res) => {
   if (!sock || !isConnected) return res.json({ success: false, error: 'Not connected' })
   try {
