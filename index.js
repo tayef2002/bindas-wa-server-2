@@ -1,4 +1,5 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
+const makeWASocket = require('@whiskeysockets/baileys').default
+const { useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
 const express = require('express')
 const { createClient } = require('@supabase/supabase-js')
 const { Boom } = require('@hapi/boom')
@@ -73,21 +74,22 @@ app.post('/api/send-message', async (req, res) => {
 
 async function startClient() {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('/tmp/baileys_auth')
+    const { state, saveCreds } = await useMultiFileAuthState('/tmp/baileys_auth_v3')
     const logger = P({ level: 'silent' })
 
     sock = makeWASocket({
-      version: [2, 3000, 1015901307],
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
       logger,
       printQRInTerminal: false,
-      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      browser: ['Bindas AI', 'Safari', '1.0'],
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
     })
 
     sock.ev.on('creds.update', saveCreds)
